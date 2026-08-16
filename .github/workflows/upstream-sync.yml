@@ -1,0 +1,237 @@
+name: Sync upstream FCX
+
+on:
+  schedule:
+    # Every Monday at 11:20 in China (03:20 UTC).
+    - cron: "20 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: Branch that carries the macOS changes
+        required: false
+        default: agent/add-macos-liquid-glass-client
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-${{ inputs.target_branch || 'agent/add-macos-liquid-glass-client' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: z3183644/FCX
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: ${{ inputs.target_branch || 'agent/add-macos-liquid-glass-client' }}
+
+jobs:
+  prepare:
+    name: Prepare upstream merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_updates: ${{ steps.merge.outputs.has_updates }}
+      sync_branch: ${{ steps.merge.outputs.sync_branch }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+    steps:
+      - name: Checkout macOS branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch and merge upstream
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags
+
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          short_sha="${upstream_sha:0:12}"
+          sync_branch="automation/upstream-${short_sha}"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "sync_branch=${sync_branch}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "The target branch already contains upstream ${short_sha}."
+            exit 0
+          fi
+
+          echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null 2>&1; then
+            echo "Sync branch ${sync_branch} already exists; reusing it."
+            exit 0
+          fi
+
+          git switch -c "$sync_branch"
+          set +e
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+          merge_status=$?
+          set -e
+
+          if [[ $merge_status -ne 0 ]]; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            git merge --abort
+            issue_title="Upstream sync conflict: ${short_sha}"
+            issue_body="$(printf 'FCX upstream `%s` cannot be merged automatically into `%s`.\n\nConflicting files:\n```text\n%s\n```\n\nWorkflow run: %s/%s/actions/runs/%s' "$upstream_sha" "$TARGET_BRANCH" "$conflicts" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+            existing_issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "${issue_title} in:title" --json number --jq '.[0].number // empty')"
+            if [[ -n "$existing_issue" ]]; then
+              gh issue comment "$existing_issue" --repo "$GITHUB_REPOSITORY" --body "$issue_body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$issue_title" --body "$issue_body"
+            fi
+            echo "Automatic merge failed. See the conflict issue for details." >&2
+            exit 1
+          fi
+
+          git push --set-upstream origin "$sync_branch"
+
+  userscript:
+    name: Test userscript
+    needs: prepare
+    if: needs.prepare.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: FCX
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sync_branch }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: FCX/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run complete userscript checks
+        run: npm run check
+
+  backend:
+    name: Test backend (${{ matrix.os }})
+    needs: prepare
+    if: needs.prepare.outputs.has_updates == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sync_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Run backend tests
+        run: python -m pytest backend/tests -q
+
+  macos-package:
+    name: Build macOS package
+    needs: prepare
+    if: needs.prepare.outputs.has_updates == 'true'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sync_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt pytest
+
+      - name: Build application
+        run: ./backend/build_macos.sh
+
+  create-pr:
+    name: Open sync pull request
+    needs: [prepare, userscript, backend, macos-package]
+    if: needs.prepare.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or update draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ needs.prepare.outputs.sync_branch }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          existing_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$SYNC_BRANCH" --base "$TARGET_BRANCH" --json url --jq '.[0].url // empty')"
+          if [[ -n "$existing_pr" ]]; then
+            echo "Sync PR already exists: ${existing_pr}"
+            exit 0
+          fi
+
+          body="$(printf '## Upstream update\n\nMerge `%s/%s` at `%s` into the macOS maintenance branch.\n\n## Automated validation\n\n- Userscript type checking, tests, and build passed.\n- Backend tests passed on Windows and macOS.\n- The macOS application package built successfully.\n\nThis PR is intentionally a draft and requires human review before merging.\n\nUpstream project: https://github.com/%s' "$UPSTREAM_REPOSITORY" "$UPSTREAM_BRANCH" "$UPSTREAM_SHA" "$UPSTREAM_REPOSITORY")"
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --base "$TARGET_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --title "Sync FCX upstream ${UPSTREAM_SHA:0:12}" \
+            --body "$body"
+
+  report-test-failure:
+    name: Report validation failure
+    needs: [prepare, userscript, backend, macos-package]
+    if: >-
+      ${{ always() && needs.prepare.outputs.has_updates == 'true' &&
+      (needs.userscript.result == 'failure' || needs.backend.result == 'failure' ||
+      needs.macos-package.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or update failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          SYNC_BRANCH: ${{ needs.prepare.outputs.sync_branch }}
+        run: |
+          set -euo pipefail
+          short_sha="${UPSTREAM_SHA:0:12}"
+          issue_title="Upstream sync validation failed: ${short_sha}"
+          issue_body="$(printf 'The upstream merge was clean, but automated validation failed.\n\nSync branch: `%s`\nWorkflow run: %s/%s/actions/runs/%s\n\nNo pull request was created. Review the failed job before retrying.' "$SYNC_BRANCH" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          existing_issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "${issue_title} in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing_issue" ]]; then
+            gh issue comment "$existing_issue" --repo "$GITHUB_REPOSITORY" --body "$issue_body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$issue_title" --body "$issue_body"
+          fi
